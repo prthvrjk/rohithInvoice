@@ -1,15 +1,20 @@
 """
 Tax Invoice generator (SLNS LOGISTICS style).
 
-PHASE 1 (this file): all invoice values live in the INVOICE_DATA dict below,
-hardcoded to match the sample invoice image. Layout/rendering is done with
-python-docx and mirrors the source image cell-for-cell.
+PHASE 1: `load_invoice_data()` - all invoice values hardcoded, matching the
+sample invoice image. Kept around for reference/testing without an Excel
+file on hand.
 
-PHASE 2 (future): replace `load_invoice_data()` with a function that reads
-the same keys out of an Excel workbook (e.g. via openpyxl/pandas), matching
-each value to the cell beside its label. The rendering code (`build_invoice`)
-will not need to change - only `load_invoice_data()` does.
+PHASE 2 (current default): `load_invoice_data_from_excel()` reads the same
+data out of Invoice_Data.xlsx (see create_excel_template.py for the sheet
+layout - label in column A, value in column B, blank rows are just visual
+section breaks). GST/CGST/SGST and every total are computed here, never
+read from the sheet. Either loader returns the same dict shape, so
+`build_invoice()` itself never needs to change.
 """
+
+import os
+import datetime
 
 from docx import Document
 from docx.shared import Pt, Cm, Emu, RGBColor
@@ -17,8 +22,37 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from openpyxl import load_workbook
 
 DEFAULT_FONT = "Arial"
+
+# Column-A label text for every dynamic field in Invoice_Data.xlsx. Shared between
+# the reader below and create_excel_template.py so the two can never drift apart.
+EXCEL_FIELD_LABELS = {
+    "invoice_no": "Invoice No",
+    "invoice_date": "Invoice Date",
+    "due_date": "Due Date",
+    "place_of_supply": "Place of Supply",
+    "bill_to_name": "Bill To Company Name",
+    "bill_to_address": "Bill To Address",
+    "bill_to_state": "Bill To State",
+    "bill_to_gstin": "Bill To GSTIN",
+    "shipping_address": "Shipping Address",
+    "transport_name": "Transport Name",
+    "transport_delivery_date": "Delivery Date",
+    "transport_vehicle_number": "Vehicle Number",
+    "transport_delivery_location": "Delivery Location",
+    "item_name": "Item Name",
+    "item_quantity": "Quantity",
+    "item_unit": "Unit",
+    "item_price_per_unit": "Price Per Unit",
+    "amount_in_words": "Invoice Amount In Words",
+    "bank_name": "Bank Name",
+    "bank_account_no": "Account No",
+    "bank_ifsc": "IFSC Code",
+    "bank_account_holder": "Account Holder Name",
+    "signature": "Signature",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +132,157 @@ def load_invoice_data():
             "for_company": "For SLNS LOGISTICS",
             "signatory_name": "Bharathil",
             "label": "Authorized Signatory",
+        },
+    }
+
+
+def _num(value, default=0.0):
+    """Coerce an Excel cell value to float, tolerating None/blank cells."""
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _fmt_value(value):
+    """Render an Excel cell value as display text - Excel may hand back a
+    real datetime even when the sheet displays a plain date string."""
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.strftime("%d-%b-%Y")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _fmt_money(value):
+    return f"{value:,.2f}"
+
+
+def _fmt_qty(value):
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def load_invoice_data_from_excel(path, image_out_dir=None):
+    """Phase 2 loader: reads Invoice_Data.xlsx (label in column A, value in
+    column B - blank rows are just visual section breaks in the sheet, not
+    meaningful to this code, which matches by label text instead) and
+    returns the same dict shape load_invoice_data() does.
+
+    GST/CGST/SGST and every total are computed here (5% GST, split 2.5%
+    CGST / 2.5% SGST off the taxable amount) - none of that is read from the
+    sheet. Received is always 0 and Balance always equals the grand total.
+    The signature is whatever picture is embedded in the sheet (anywhere) -
+    extracted to a PNG next to the workbook and inserted as an image instead
+    of typed text.
+    """
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+
+    raw = {}
+    for row in ws.iter_rows():
+        label_cell = row[0]
+        value_cell = row[1] if len(row) > 1 else None
+        label = label_cell.value
+        if label is None or str(label).strip() == "":
+            continue
+        raw[str(label).strip()] = value_cell.value if value_cell is not None else None
+
+    def get(key):
+        return raw.get(EXCEL_FIELD_LABELS[key])
+
+    # ---- Signature: first picture embedded anywhere in the sheet ----
+    image_out_dir = image_out_dir or os.path.dirname(os.path.abspath(path))
+    signature_path = None
+    images = getattr(ws, "_images", [])
+    if images:
+        signature_path = os.path.join(image_out_dir, "_signature_extracted.png")
+        with open(signature_path, "wb") as f:
+            f.write(images[0]._data())
+
+    # ---- Line item + GST math (5% GST, split 2.5% CGST / 2.5% SGST) ----
+    qty = _num(get("item_quantity"))
+    price_per_unit = _num(get("item_price_per_unit"))
+    taxable_amount = qty * price_per_unit
+    gst_rate = 5.0
+    cgst_rate = gst_rate / 2
+    sgst_rate = gst_rate / 2
+    cgst_amt = taxable_amount * cgst_rate / 100
+    sgst_amt = taxable_amount * sgst_rate / 100
+    gst_amount = cgst_amt + sgst_amt
+    line_amount = taxable_amount + gst_amount
+    grand_total = line_amount
+
+    bill_to_address_lines = _fmt_value(get("bill_to_address")).split("\n")
+
+    return {
+        "company": {
+            "name": "SLNS LOGISTICS",
+            "address_lines": [
+                "Plot No : 118, Balaji Nagar, Beeramguda,",
+                "Hyderabad, Sangareddy, Telangana - 502032",
+            ],
+            "phone": "6304066403",
+            "email": "Logisticsslns@gmail.com",
+            "gstin": "36ANLPK6091R1Z2",
+            "state": "36-Telangana",
+        },
+        "invoice": {
+            "no": _fmt_value(get("invoice_no")),
+            "date": _fmt_value(get("invoice_date")),
+            "due_date": _fmt_value(get("due_date")),
+            "place_of_supply": _fmt_value(get("place_of_supply")),
+        },
+        "bill_to": {
+            "name": _fmt_value(get("bill_to_name")),
+            "address_lines": bill_to_address_lines,
+            "state": _fmt_value(get("bill_to_state")),
+            "gstin": _fmt_value(get("bill_to_gstin")),
+        },
+        "shipping_address": _fmt_value(get("shipping_address")),
+        "transport": {
+            "name": _fmt_value(get("transport_name")),
+            "delivery_date": _fmt_value(get("transport_delivery_date")),
+            "vehicle_number": _fmt_value(get("transport_vehicle_number")),
+            "delivery_location": _fmt_value(get("transport_delivery_location")),
+        },
+        "items": [
+            {
+                "sno": 1,
+                "name": _fmt_value(get("item_name")),
+                "qty": _fmt_qty(qty),
+                "unit": _fmt_value(get("item_unit")),
+                "price_per_unit": _fmt_money(price_per_unit),
+                "gst_amount": _fmt_money(gst_amount),
+                "gst_rate": f"{gst_rate:g}",
+                "amount": _fmt_money(line_amount),
+            }
+        ],
+        "tax_summary": {
+            "taxable_amount": _fmt_money(taxable_amount),
+            "cgst_rate": f"{cgst_rate:g}",
+            "cgst_amt": _fmt_money(cgst_amt),
+            "sgst_rate": f"{sgst_rate:g}",
+            "sgst_amt": _fmt_money(sgst_amt),
+            "total_tax": _fmt_money(gst_amount),
+        },
+        "totals": {
+            "sub_total": _fmt_money(line_amount),
+            "total_tax": _fmt_money(gst_amount),
+            "total": _fmt_money(grand_total),
+        },
+        "amount_in_words": _fmt_value(get("amount_in_words")),
+        "received": "0.00",
+        "balance": _fmt_money(grand_total),
+        "bank": {
+            "name": _fmt_value(get("bank_name")),
+            "account_no": _fmt_value(get("bank_account_no")),
+            "ifsc": _fmt_value(get("bank_ifsc")),
+            "account_holder": _fmt_value(get("bank_account_holder")),
+        },
+        "signatory": {
+            "for_company": "For SLNS LOGISTICS",
+            "signatory_name": "",
+            "label": "Authorized Signatory",
+            "image_path": signature_path,
         },
     }
 
@@ -472,6 +657,11 @@ def build_invoice(data, out_path="Tax_Invoice.docx"):
     add_gap(doc)
 
     # ---- Tax Summary ----
+    tax_label_run = doc.add_paragraph().add_run("Tax Summary:")
+    tax_label_run.bold = True
+    tax_label_run.font.size = Pt(8)
+    set_run_font(tax_label_run)
+
     # Columns: Taxable Amount | CGST Rate | CGST Amt | SGST Rate | SGST Amt | Total Tax
     # Same total_width-ratio approach as the items table, so this table's edges also
     # land exactly on the page margins instead of stopping short of them.
@@ -559,16 +749,41 @@ def build_invoice(data, out_path="Tax_Invoice.docx"):
 
     sign = data["signatory"]
     sign_cell = footer_table.cell(0, 1)
-    add_cell_lines(sign_cell, [
-        (sign["for_company"], True, 8),
-        ("", False, 2),
-        ("", False, 2),
-        (sign["signatory_name"], False, 10),
-        (sign["label"], False, 8),
-    ])
-    sign_cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    for para in sign_cell.paragraphs:
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sign_cell.text = ""
+    p0 = sign_cell.paragraphs[0]
+    p0.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r0 = p0.add_run(sign["for_company"])
+    r0.bold = True
+    r0.font.size = Pt(8)
+    set_run_font(r0)
+
+    image_path = sign.get("image_path")
+    if image_path and os.path.exists(image_path):
+        # Actual signature picture (extracted from the Excel sheet) instead of typed text.
+        p_img = sign_cell.add_paragraph()
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p_img.paragraph_format.space_before = Pt(4)
+        p_img.paragraph_format.space_after = Pt(0)
+        p_img.add_run().add_picture(image_path, height=Cm(1.0))
+    else:
+        for _ in range(2):
+            gap_p = sign_cell.add_paragraph()
+            gap_p.paragraph_format.space_before = Pt(0)
+            gap_p.paragraph_format.space_after = Pt(0)
+            gap_run = gap_p.add_run("")
+            gap_run.font.size = Pt(2)
+            set_run_font(gap_run)
+        name_p = sign_cell.add_paragraph()
+        name_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        name_run = name_p.add_run(sign["signatory_name"])
+        name_run.font.size = Pt(10)
+        set_run_font(name_run)
+
+    label_p = sign_cell.add_paragraph()
+    label_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    label_run = label_p.add_run(sign["label"])
+    label_run.font.size = Pt(8)
+    set_run_font(label_run)
 
     apply_borders_to_table(footer_table)
 
@@ -577,6 +792,11 @@ def build_invoice(data, out_path="Tax_Invoice.docx"):
 
 
 if __name__ == "__main__":
-    data = load_invoice_data()
+    excel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Invoice_Data.xlsx")
+    if os.path.exists(excel_path):
+        data = load_invoice_data_from_excel(excel_path)
+    else:
+        print(f"{excel_path} not found - falling back to the hardcoded phase 1 sample data.")
+        data = load_invoice_data()
     path = build_invoice(data, out_path="Tax_Invoice.docx")
     print(f"Invoice generated: {path}")

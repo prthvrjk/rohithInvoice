@@ -1,2 +1,4 @@
 ~$*
 .claude/settings.local.json
+__pycache__/
+_signature_extracted.png
