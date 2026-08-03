@@ -178,25 +178,63 @@ def load_invoice_data_from_excel(path, image_out_dir=None):
     ws = wb.active
 
     raw = {}
+    signature_row = None
     for row in ws.iter_rows():
         label_cell = row[0]
         value_cell = row[1] if len(row) > 1 else None
         label = label_cell.value
         if label is None or str(label).strip() == "":
             continue
-        raw[str(label).strip()] = value_cell.value if value_cell is not None else None
+        label = str(label).strip()
+        raw[label] = value_cell.value if value_cell is not None else None
+        if label == EXCEL_FIELD_LABELS["signature"]:
+            signature_row = label_cell.row  # 1-indexed
 
     def get(key):
         return raw.get(EXCEL_FIELD_LABELS[key])
 
-    # ---- Signature: first picture embedded anywhere in the sheet ----
+    # ---- Signature ----
+    # Preferred: the "Signature" value cell holds a filename/path to a standalone
+    # image file (relative to the workbook's folder, or absolute) - simple and
+    # reliable, since it doesn't depend on Excel's image-embedding surviving
+    # however the sheet was created, edited, or copied to someone else's machine.
+    # Fallback: a picture embedded directly in the sheet. If there's more than
+    # one image, pick whichever is anchored closest to the "Signature" row
+    # instead of just grabbing the first one, so an unrelated image elsewhere
+    # in the sheet can't get used by accident.
     image_out_dir = image_out_dir or os.path.dirname(os.path.abspath(path))
     signature_path = None
-    images = getattr(ws, "_images", [])
-    if images:
-        signature_path = os.path.join(image_out_dir, "_signature_extracted.png")
-        with open(signature_path, "wb") as f:
-            f.write(images[0]._data())
+    sig_value = get("signature")
+    if sig_value:
+        candidate = str(sig_value).strip()
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(image_out_dir, candidate)
+        if os.path.exists(candidate):
+            signature_path = candidate
+        else:
+            print(f"Warning: Signature cell points to '{sig_value}' but that file "
+                  f"was not found at '{candidate}'.")
+
+    if signature_path is None:
+        images = getattr(ws, "_images", [])
+        if images:
+            chosen = images[0]
+            if len(images) > 1 and signature_row is not None:
+                def _anchor_row(img):
+                    try:
+                        return img.anchor._from.row  # 0-indexed
+                    except AttributeError:
+                        return None
+                with_rows = [(img, _anchor_row(img)) for img in images]
+                with_rows = [(img, r) for img, r in with_rows if r is not None]
+                if with_rows:
+                    chosen = min(with_rows, key=lambda pair: abs(pair[1] - (signature_row - 1)))[0]
+            signature_path = os.path.join(image_out_dir, "_signature_extracted.png")
+            with open(signature_path, "wb") as f:
+                f.write(chosen._data())
+        else:
+            print("Warning: the Signature cell has no filename and no picture is embedded "
+                  "in the workbook. The invoice will have no signature image.")
 
     # ---- Line item + GST math (5% GST, split 2.5% CGST / 2.5% SGST) ----
     qty = _num(get("item_quantity"))
@@ -465,6 +503,31 @@ def apply_borders_to_table(table, sz=4):
             all_borders(cell, sz=sz)
 
 
+def set_table_grid_borders(table, sz=4, color="000000", val="single"):
+    """Set borders at the table-property level (top/left/bottom/right/insideH/insideV),
+    as a base layer under the per-cell borders set by apply_borders_to_table().
+
+    Needed for tables that mix a cell merged across several rows next to cells that
+    are only merged within a single row (e.g. the tax summary table's "Taxable Amount"
+    column spanning both header rows while "CGST"/"SGST" split into Rate/Amt below it).
+    That shape creates a T-junction in the grid where per-cell tcBorders alone can
+    leave a gap in Word's rendering - the table-level grid fills that seam in."""
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+    tblBorders = tblPr.find(qn("w:tblBorders"))
+    if tblBorders is None:
+        tblBorders = OxmlElement("w:tblBorders")
+        tblPr.append(tblBorders)
+    for tag in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = tblBorders.find(qn(f"w:{tag}"))
+        if el is None:
+            el = OxmlElement(f"w:{tag}")
+            tblBorders.append(el)
+        el.set(qn("w:val"), val)
+        el.set(qn("w:sz"), str(sz))
+        el.set(qn("w:color"), color)
+
+
 def add_gap(doc, pt=2):
     """Small vertical spacer between tables (docx tables can't be adjacent with custom gaps)."""
     p = doc.add_paragraph()
@@ -703,6 +766,7 @@ def build_invoice(data, out_path="Tax_Invoice.docx"):
     set_cell_text(tax_table.cell(3, 5), tax["total_tax"], bold=True, size=7, align=WD_ALIGN_PARAGRAPH.CENTER)
 
     apply_borders_to_table(tax_table)
+    set_table_grid_borders(tax_table)
 
     add_gap(doc)
 

@@ -9,8 +9,17 @@ without breaking anything.
 
 To edit the invoice data: open Invoice_Data.xlsx directly and change the
 values in column B. Re-run this script only if you want to regenerate the
-template from scratch with different sample defaults, or to replace the
-embedded signature image.
+template from scratch with different sample defaults, or a different
+signature.
+
+Signature: the Signature row's value cell holds a filename (e.g.
+"signature_sample.png") - generate_invoice.py looks for that file next to
+Invoice_Data.xlsx and inserts it as a picture. This is the recommended way
+to hand off the invoice generator to someone else: send generate_invoice.py,
+Invoice_Data.xlsx, and the signature PNG together, and it just works
+regardless of Excel version or how the files were copied. (Embedding a
+picture directly in the sheet also still works as a fallback if the
+Signature cell is left blank - see load_invoice_data_from_excel().)
 
 Do not rename the labels in column A - generate_invoice.py looks them up by
 this exact text (see EXCEL_FIELD_LABELS in that file).
@@ -19,7 +28,6 @@ this exact text (see EXCEL_FIELD_LABELS in that file).
 import os
 
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Font
 
 from generate_invoice import EXCEL_FIELD_LABELS as L
@@ -27,9 +35,8 @@ from generate_invoice import EXCEL_FIELD_LABELS as L
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def build_template(out_path=None, signature_image_path=None):
+def build_template(out_path=None, signature_filename="signature_sample.png"):
     out_path = out_path or os.path.join(HERE, "Invoice_Data.xlsx")
-    signature_image_path = signature_image_path or os.path.join(HERE, "signature_sample.png")
 
     wb = Workbook()
     ws = wb.active
@@ -68,14 +75,13 @@ def build_template(out_path=None, signature_image_path=None):
         (L["bank_ifsc"], "HDFC0002073"),
         (L["bank_account_holder"], "SLNS LOGISTICS"),
         None,
-        (L["signature"], None),
+        (L["signature"], signature_filename),
     ]
 
     label_font = Font(bold=True)
     wrap_top = Alignment(wrap_text=True, vertical="top")
 
     row_idx = 1
-    signature_row = None
     for entry in rows:
         if entry is None:
             row_idx += 1
@@ -86,16 +92,7 @@ def build_template(out_path=None, signature_image_path=None):
             cell = ws.cell(row=row_idx, column=2, value=value)
             if isinstance(value, str) and "\n" in value:
                 cell.alignment = wrap_top
-        if label == L["signature"]:
-            signature_row = row_idx
         row_idx += 1
-
-    if signature_image_path and os.path.exists(signature_image_path) and signature_row:
-        img = XLImage(signature_image_path)
-        img.width = 140
-        img.height = 33
-        ws.add_image(img, f"B{signature_row}")
-        ws.row_dimensions[signature_row].height = 30
 
     wb.save(out_path)
     return out_path
